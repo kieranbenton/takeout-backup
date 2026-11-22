@@ -19,6 +19,7 @@ It should be the simplest thing that works. Every couple of months: one command 
 | Downloading | The tool does it. Playwright drives the user's own Chrome, and the tool downloads each part itself with resume and retry. |
 | Processing | One zip part at a time: check, unpack, copy to the external drive, upload new files to S3, delete the zip. |
 | Storage | One S3 bucket in the user's own AWS account, in Glacier Deep Archive with AWS-managed encryption. Files are stored unpacked under the same paths as on the drive. Unchanged files are never uploaded twice. |
+| Provisioning | One CloudFormation template in the repo, for the bucket and the tool's IAM user. Deployed by `takeout-backup setup`, or by hand with the AWS CLI or console. |
 | File contents | Exactly what Takeout gives. Photos keep their `.json` sidecar files and nothing is rewritten. |
 | Deletions | A file missing from a newer export is deleted from the backup only after a year. |
 | Copies | Two: S3 and the external drive, kept in step by the tool. |
@@ -33,6 +34,8 @@ It should be the simplest thing that works. Every couple of months: one command 
 - **Takeout delivery to Drive, Dropbox or Box:** Drive uses up the Google storage quota, and the others cost money. OneDrive isn't offered for these accounts.
 - **A cloud machine doing the downloads:** more moving parts. The Mac already has a signed-in browser and the external drive.
 - **Fixing photo dates and locations:** the `.json` sidecars keep that information, and a fix-up tool can be added later without changing the archive.
+- **Terraform:** it needs a state file kept safe somewhere other than the bucket it describes, and every user would need Terraform installed. CloudFormation keeps its state in AWS and needs nothing extra.
+- **AWS CDK:** before first use it installs its own bucket, roles and container registry into the account. That's too much for one bucket and one user.
 - **Encrypting before upload:** the main risks are lockout and accidental deletion, not theft. A key you can lose is a bigger risk than one you can't.
 - **Google's incremental Photos export:** it wasn't offered for these accounts, so each export is a full copy. The tool skips files it already has, so this costs download time but not storage.
 
@@ -86,7 +89,16 @@ External drive:
   manifests/...
 ```
 
-### Bucket settings (`takeout-backup setup`)
+### Provisioning
+
+`infra/takeout-backup.yaml` is a CloudFormation template that creates the bucket and the tool's IAM user and policy.
+
+- **`takeout-backup setup`** deploys it through the AWS SDK, using an admin profile the user already has. It then creates an access key for the tool's IAM user and saves it to a local AWS profile (`takeout-backup`). The key is never a stack output, so it never appears in the console.
+- **Deploying by hand** works too: `aws cloudformation deploy --template-file infra/takeout-backup.yaml --stack-name takeout-backup --capabilities CAPABILITY_NAMED_IAM`.
+- **The archive outlives the stack:** the bucket has `DeletionPolicy: Retain` and `UpdateReplacePolicy: Retain`, so deleting or replacing the stack never deletes it.
+- **Changes are reviewed first:** setup goes through a change set, and the user sees what will change before applying it. Drift detection comes free with CloudFormation.
+
+### Bucket settings
 
 - **Versioning on.** Overwriting or deleting a file keeps the previous version.
 - **Lifecycle rules:**
@@ -138,6 +150,8 @@ Deep Archive bills each object for at least 180 days, which the 1-year grace per
 ## Code layout (planned)
 
 ```
+infra/
+  takeout-backup.yaml   CloudFormation: bucket, lifecycle, IAM user and policy
 src/
   cli.ts                commands: setup, run, ingest, status, restore
   config.ts             accounts, drive path, bucket, AWS profile
@@ -183,6 +197,6 @@ A yearly calendar event is the reminder.
 
 1. **Spike:** sign in, find an export, download one part with resume. Proves risks 1–2.
 2. **Processing:** zip check, unpack, manifest, drive copy, deletion handling, using sample zips.
-3. **S3:** `setup` (bucket, versioning, lifecycle, IAM policy), uploads, deletions.
+3. **S3:** the CloudFormation template and `setup` (change set, access key, local profile), then uploads and deletions.
 4. **Finishing:** `status`, the `ingest` fallback, `restore`, the fix-the-download skill, README runbook.
 5. **First real run** across all three accounts.
