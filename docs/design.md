@@ -22,7 +22,7 @@ It should be the simplest thing that works. Every couple of months you spend a f
 | Deletions | A file missing from a newer export is deleted from the archive only after a year, through bucket versioning. |
 | Copies | One copy outside Google: S3. There's no external-drive copy. |
 | Provisioning | One CloudFormation template, deployed by `takeout-backup setup` with the AWS CLI and an admin sign-in. |
-| Notifications | An email per run (summary or error), and an AWS Budgets alert above $5 a month. |
+| Notifications | A progress email every 2 hours while a run is still going, a final email per run (summary or error), and an AWS Budgets alert above $5 a month. |
 | Reminders | Calendar events every 2 months, plus one yearly. No background jobs on the Mac. |
 | Restore | Must work without this tool: the archive is plain files under plain paths. Only the owner restores, for now. |
 | Distribution | npm package (`takeout-backup`). The worker image is published to GitHub's container registry. GitHub Actions runs lint and tests on every PR. |
@@ -64,6 +64,14 @@ It should be the simplest thing that works. Every couple of months you spend a f
    5. Record them in the manifest.
    6. Delete the staged zip.
 8. **Finish the export.** Once every part of an account's export is processed, the worker compares its full file list with the previous export. Files that have disappeared are deleted in the archive; versioning keeps them for a year.
+While steps 6–8 run, the worker emails a progress update every 2 hours through SNS, starting 2 hours into the run. Each update gives:
+
+- the current account and part, and how many parts are done out of the total;
+- files and bytes uploaded so far;
+- an estimated finish time, based on progress so far.
+
+A run that finishes within 2 hours sends only the final email. The same figures are written to `runs/<run-id>/progress.json`, so `takeout-backup status` can show them at any time.
+
 9. **Report.** The worker emails a summary through SNS: per account, new, changed and deleted files, bytes, and any parts that failed. It writes the same summary to the bucket for `takeout-backup status`, then stops.
 
 ### When something goes wrong
@@ -103,6 +111,7 @@ Neither the tool's user nor the worker can permanently delete anything: deleted 
 s3://<archive-bucket>/
   accounts/<account>/Takeout/...                 files exactly as Takeout lays them out
   manifests/<account>/<export-id>.json.gz        path, size, CRC-32 and SHA-256 per file
+  runs/<run-id>/progress.json                    live progress, updated as the run goes
   runs/<run-id>/summary.json                     what each run did
 ```
 
@@ -151,7 +160,7 @@ src/
     fetch.ts                parallel Google-to-staging copies (multipart, size-checked)
     zip.ts                  read zips in S3 with ranged reads
     archive.ts              compare with manifest, upload with SHA-256, record deletions
-    notify.ts               summary email and summary.json
+    notify.ts               2-hourly progress emails, the summary email, progress.json and summary.json
   shared/                   types and the manifest format
 Dockerfile                  worker image
 test/
