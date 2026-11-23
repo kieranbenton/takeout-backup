@@ -18,7 +18,7 @@ mkdirSync(OUT, { recursive: true });
 
 const started = Date.now();
 const report = {
-  spikeVersion: 1,
+  spikeVersion: 2,
   startedAt: new Date(started).toISOString(),
   node: process.version,
   platform: `${process.platform} ${process.arch}`,
@@ -107,37 +107,43 @@ async function main() {
   }
 
   // 4. Press Download and capture the link, cancelling the local download.
-  const captured = { url: null, method: null, cancelled: false, reauthSeen: false, cookieHeaderSent: null, contentLength: null };
+  // The browser's download event is the source of truth. Google's own
+  // background requests (/_/…) are also labelled as attachments, so the
+  // response sniff below ignores them and only serves as a fallback.
+  const captured = { downloadUrl: null, sniffUrl: null, suggestedFilename: null, cancelled: false, reauthSeen: false, contentLength: null };
+  const navRequests = []; // document/other requests after the click, for the report
+  const requestByUrl = new Map();
+  let clicked = false;
   const attach = (p) =>
     p.on("download", async (d) => {
-      if (!captured.url) {
-        captured.url = d.url();
-        captured.method = "playwright-download-event";
-        captured.suggestedFilename = d.suggestedFilename();
-      }
+      captured.downloadUrl ??= d.url();
+      captured.suggestedFilename ??= d.suggestedFilename();
       await d.cancel().then(() => (captured.cancelled = true)).catch(() => {});
     });
   context.pages().forEach(attach);
   context.on("page", attach);
-  context.on("response", async (resp) => {
+  context.on("request", (req) => {
+    const type = req.resourceType();
+    if (!clicked || (type !== "document" && type !== "other")) return;
+    requestByUrl.set(req.url(), req);
+    if (navRequests.length < 15) navRequests.push(`${type}: ${redactUrl(req.url())}`);
+  });
+  context.on("response", (resp) => {
     const url = resp.url();
-    const host = safeHost(url);
-    if (host === "accounts.google.com" && /challenge|signin|reauth/i.test(url)) captured.reauthSeen = true;
-    const disposition = resp.headers()["content-disposition"] || "";
-    const looksLikeZip = /attachment/i.test(disposition) || /\.zip$/i.test(safePath(url));
-    if (looksLikeZip && resp.status() < 300) {
-      captured.contentLength ??= Number(resp.headers()["content-length"]) || null;
-      if (captured.cookieHeaderSent === null) {
-        captured.cookieHeaderSent = await resp.request().allHeaders().then((h) => "cookie" in h).catch(() => null);
-      }
-      if (!captured.url) {
-        captured.url = url;
-        captured.method = "response-sniff";
-      }
+    if (safeHost(url) === "accounts.google.com" && /challenge|signin|reauth/i.test(url)) captured.reauthSeen = true;
+    const type = resp.request().resourceType();
+    if (type !== "document" && type !== "other") return;
+    if (safePath(url).startsWith("/_/")) return;
+    const h = resp.headers();
+    const zipish = /zip|octet-stream/i.test(h["content-type"] || "") || /\.zip/i.test(h["content-disposition"] || "") || /\.zip$/i.test(safePath(url));
+    if (zipish && resp.status() < 300) {
+      captured.sniffUrl ??= url;
+      captured.contentLength ??= Number(h["content-length"]) || null;
     }
   });
 
   const clickStart = Date.now();
+  clicked = true;
   if (anchorCount > 0) {
     log("Pressing Download on the first part of your newest export…");
     await anchors.first().click();
@@ -147,21 +153,32 @@ async function main() {
     report.clickedBy = "you";
   }
   log("If Google asks for your password, enter it in the Chrome window.");
-  while (!captured.url && Date.now() - clickStart < 5 * 60_000) await sleep(500);
-  if (!captured.url) throw new Error("No download started within 5 minutes.");
-  await sleep(2000); // let the cancel and header capture settle
-  const url = captured.url;
+  while (!captured.downloadUrl && !captured.sniffUrl && Date.now() - clickStart < 5 * 60_000) await sleep(500);
+  const seconds = Math.round((Date.now() - clickStart) / 1000);
+  // Give the download event a moment to arrive if only the sniff fired.
+  for (let i = 0; i < 10 && !captured.downloadUrl; i++) await sleep(500);
+  await sleep(1500); // let the cancel settle
+  const url = captured.downloadUrl ?? captured.sniffUrl;
   report.capture = {
-    method: captured.method,
-    secondsToCapture: Math.round((Date.now() - clickStart) / 1000),
+    method: captured.downloadUrl ? "download-event" : captured.sniffUrl ? "response-sniff" : "none",
+    secondsToCapture: seconds,
     reauthSeen: captured.reauthSeen,
     localDownloadCancelled: captured.cancelled,
+    sniffAgreesWithDownloadEvent: captured.downloadUrl && captured.sniffUrl ? captured.downloadUrl === captured.sniffUrl : null,
     sizeFromBrowserHeaders: captured.contentLength,
-    cookieHeaderSent: captured.cookieHeaderSent,
-    urlShape: redactUrl(url),
+    urlShape: url ? redactUrl(url) : null,
     filenameShape: captured.suggestedFilename ? captured.suggestedFilename.replace(/\d/g, "9") : null,
+    navigationAfterClick: navRequests,
   };
-  log(`Captured the link (${report.capture.method}).`);
+  if (!url) throw new Error("No download started within 5 minutes.");
+  const req = requestByUrl.get(url);
+  if (req) {
+    report.capture.cookieHeaderSent = await req.allHeaders().then((h) => "cookie" in h).catch(() => null);
+    const chain = [];
+    for (let r = req.redirectedFrom(); r && chain.length < 10; r = r.redirectedFrom()) chain.unshift(redactUrl(r.url()));
+    report.capture.redirectChain = chain;
+  }
+  log(`Captured the download link (${report.capture.method}).`);
 
   // 5. AWS CloudShell test command (contains the private link: never share it).
   const curl = `curl -sS -r 0-1023 -o /dev/null -w 'cloudshell: status=%{http_code} bytes=%{size_download} type=%{content_type}\\n' '${url}'`;
@@ -208,14 +225,17 @@ ${curl}
 async function inspectPage(page, name) {
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await sleep(2000);
-  const anchors = page.locator('a[href*="takeout/download"]');
+  const all = page.locator('a[href*="takeout/download"]');
+  const anchors = page.locator('a[href*="takeout/download"]:visible');
   const anchorCount = await anchors.count();
-  const firstHref = anchorCount ? await anchors.first().getAttribute("href") : null;
+  // a.href is the address the browser will actually use (it respects <base>).
+  const firstHref = anchorCount ? await anchors.first().evaluate((a) => a.href).catch(() => null) : null;
   const summary = {
     pathShape: safePath(page.url()).replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, "<id>"),
-    downloadLinkCount: anchorCount,
+    downloadLinkCount: await all.count(),
+    visibleDownloadLinkCount: anchorCount,
     downloadButtonTextCount: await page.getByText(/^\s*Download\s*$/i).count().catch(() => null),
-    hrefShape: firstHref ? redactUrl(new URL(firstHref, page.url()).toString()) : null,
+    hrefShape: firstHref ? redactUrl(firstHref) : null,
   };
   // Kept on the Mac only: these show your account and export list.
   writeFileSync(join(OUT, `${name}.LOCAL-ONLY.html`), await page.content());
