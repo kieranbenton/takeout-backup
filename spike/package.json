@@ -1,0 +1,15 @@
+{
+  "name": "takeout-backup-spike",
+  "private": true,
+  "description": "Milestone 1 spike: checks Takeout sign-in, link capture and download behaviour before the real tool is built.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "spike": "node spike.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.64.1"
+  }
+}
