@@ -93,21 +93,18 @@ async function main() {
   log("Signed in. Looking at your exports…");
 
   // 3. Inspect the Manage exports page.
-  await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-  await sleep(2000);
-  const anchors = page.locator('a[href*="takeout/download"]');
-  const anchorCount = await anchors.count();
-  const firstHref = anchorCount ? await anchors.first().getAttribute("href") : null;
-  report.managePage = {
-    downloadLinkCount: anchorCount,
-    downloadButtonTextCount: await page.getByText(/^\s*Download\s*$/i).count().catch(() => null),
-    hrefShape: firstHref ? redactUrl(new URL(firstHref, page.url()).toString()) : null,
-  };
-  // Kept on the Mac only: these show your account and export list.
-  writeFileSync(join(OUT, "manage-page.LOCAL-ONLY.html"), await page.content());
-  await page.screenshot({ path: join(OUT, "manage-page.LOCAL-ONLY.png"), fullPage: true }).catch(() => {});
-  const aria = await page.locator("body").ariaSnapshot().catch(() => null);
-  if (aria) writeFileSync(join(OUT, "manage-page.LOCAL-ONLY.aria.yml"), aria);
+  let { anchors, anchorCount, summary } = await inspectPage(page, "manage-page");
+  const archiveLinks = page.locator('a[href*="/manage/archive/"]');
+  report.managePage = { ...summary, archiveLinkCount: await archiveLinks.count() };
+
+  // The Download buttons may live on each export's own page instead.
+  if (anchorCount === 0 && (opts.archiveUrl || report.managePage.archiveLinkCount > 0)) {
+    const target = opts.archiveUrl ?? new URL(await archiveLinks.first().getAttribute("href"), page.url()).toString();
+    log("Opening the export's own page…");
+    await page.goto(target, { waitUntil: "domcontentloaded" });
+    ({ anchors, anchorCount, summary } = await inspectPage(page, "archive-page"));
+    report.archivePage = { openedFrom: opts.archiveUrl ? "--archive-url" : "first archive link", ...summary };
+  }
 
   // 4. Press Download and capture the link, cancelling the local download.
   const captured = { url: null, method: null, cancelled: false, reauthSeen: false, cookieHeaderSent: null, contentLength: null };
@@ -206,6 +203,26 @@ ${curl}
   log("Leave this running, or press Ctrl-C at any point: the report prints either way.");
   if (!headers) return;
   await Promise.all([lifetimeTest(url, headers), slowDownloadTest(url, headers, total)]);
+}
+
+async function inspectPage(page, name) {
+  await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+  await sleep(2000);
+  const anchors = page.locator('a[href*="takeout/download"]');
+  const anchorCount = await anchors.count();
+  const firstHref = anchorCount ? await anchors.first().getAttribute("href") : null;
+  const summary = {
+    pathShape: safePath(page.url()).replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, "<id>"),
+    downloadLinkCount: anchorCount,
+    downloadButtonTextCount: await page.getByText(/^\s*Download\s*$/i).count().catch(() => null),
+    hrefShape: firstHref ? redactUrl(new URL(firstHref, page.url()).toString()) : null,
+  };
+  // Kept on the Mac only: these show your account and export list.
+  writeFileSync(join(OUT, `${name}.LOCAL-ONLY.html`), await page.content());
+  await page.screenshot({ path: join(OUT, `${name}.LOCAL-ONLY.png`), fullPage: true }).catch(() => {});
+  const aria = await page.locator("body").ariaSnapshot().catch(() => null);
+  if (aria) writeFileSync(join(OUT, `${name}.LOCAL-ONLY.aria.yml`), aria);
+  return { anchors, anchorCount, summary };
 }
 
 async function testRanges(url, context) {
@@ -373,9 +390,10 @@ function sleep(ms) {
 }
 
 function parseArgs(argv) {
-  const o = { profile: "me", port: 9333, lifetimeMinutes: 90 };
+  const o = { profile: "me", port: 9333, lifetimeMinutes: 90, archiveUrl: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--profile") o.profile = argv[++i];
+    else if (argv[i] === "--archive-url") o.archiveUrl = argv[++i];
     else if (argv[i] === "--port") o.port = Number(argv[++i]);
     else if (argv[i] === "--minutes") o.lifetimeMinutes = Number(argv[++i]);
   }

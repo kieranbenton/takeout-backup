@@ -53,6 +53,7 @@ Then:
 
 ### Options
 
+- `--archive-url <url>`: go straight to one export's own page, the `https://takeout.google.com/manage/archive/…` address in Takeout's "ready" email. Without it, the script starts from Manage exports and opens the first export listed if the Download buttons aren't there.
 - `--profile <name>`: use a different Chrome profile, e.g. to test another account (default `me`).
 - `--minutes <n>`: how long to keep checking the link (default 90).
 - `--port <n>`: Chrome's debugging port (default 9333).
